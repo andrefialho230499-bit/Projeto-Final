@@ -1,0 +1,414 @@
+/*André Fialho Nº2020102267
+Miguel Catela  Nº2019119653
+IPLEIRIA - Instituto Politécnico de Leiria
+ESTG - Escola Superior de Tecnologia e Gestão
+LEAU- Licenciatura em Engenharia Automóvel
+SEEV - Sistemas Elétricos e Eletrónicos de Veículos
+
+TP1:  Sistema de controlo de temperatura de uma cabine frigorifica
+
+LINK:
+LINK:<script src="https://gist.github.com/andrefialho230499-bit/5daac27da4f881d1d0d6bc25d4eba89a.js"></script>
+
+*/
+
+#include <Arduino.h>
+#include <DHT11.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <MFRC522.h>
+#include <SPI.h>
+
+// Definição do pino de entrada do sensor DHT11
+#define DHTPIN 13
+
+// Definições para o display TFT
+#define TFT_CS    15
+#define TFT_RST   4
+#define TFT_DC    2
+#define TFT_MOSI  23
+#define TFT_SCK   18
+
+// Definições para o Leitor RFID
+#define RST_PIN   14
+#define SS_PIN    21
+
+// Definições para o Leitor RFID SPI
+#define RFID_MOSI 16
+#define RFID_SCK  5
+#define RFID_MISO 26
+
+// Pino para controlo da ventoinha por PWM
+#define FAN_PIN 25
+#define POT_PIN A0
+#define RPM_PIN 34
+
+//Pino do buzzer
+#define BUZZER_PIN 27
+
+// Pino IRQ do RC522 para interrupção
+#define IRQ_PIN 32
+
+// Definição do limiar de temperatura para ativar a ventoinha
+#define TEMPERATURE_THRESHOLD 19
+
+// Estrutura para armazenar os dados do sistema
+struct SystemData {
+    int temperature;
+    int humidity;
+    int rpm;
+    bool ventState;
+
+};
+
+// Estrutura para armazenar os dados da mensagem de inicio
+struct InitMessage {
+    char message[40];
+    bool isComplete;
+};
+
+// Declaração das queues
+QueueHandle_t systemDataQueue;
+QueueHandle_t rfidQueue;
+QueueHandle_t initQueue;
+
+// Declaração do Mutex para proteger o acesso ao SPI pelo leitor RFID
+SemaphoreHandle_t xMutex;
+
+// Semáforo binário para controlo do buzzer
+SemaphoreHandle_t buzzerSemaphore;
+
+//Semaforo contador de RPM
+SemaphoreHandle_t contadorRPM = NULL;
+
+//Interrupção da leitura de cartão RFID
+void IRAM_ATTR handleRFIDInterrupt() {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(buzzerSemaphore, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+//Interrupção da RPM da ventoinha
+void IRAM_ATTR handleRPMInterrupt() {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    //Cada pulso incrementa o semaforo
+    xSemaphoreGiveFromISR(contadorRPM, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+
+
+//Tarefa de incialização do sistema
+void TaskInitialize(void *pvParameters) {
+    InitMessage initMsg;
+    // Inicialização do display TFT
+    Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCK, TFT_RST);
+    tft.begin();
+    tft.setRotation(2);
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+    tft.setTextSize(2);
+
+    while (true) {
+        if (xQueueReceive(initQueue, &initMsg, portMAX_DELAY) == pdPASS) {
+        	    tft.setCursor(100, 10);
+        	    tft.println("SEEV");
+        	    tft.drawLine(0, 25, 240, 25, ILI9341_GREEN); // Linha de separação
+
+        	    tft.setCursor(75, 40);
+        	    tft.println("2025/2026");
+        	    tft.drawLine(0, 60, 240, 60, ILI9341_GREEN); // Linha de separação
+
+        	    tft.setCursor(55, 80);
+        	    tft.println("Andre Fialho");
+        	    tft.drawLine(0, 100, 240, 100, ILI9341_WHITE); // Linha de separação
+
+        	    tft.setCursor(50, 120);
+        	    tft.println("Miguel Catela");
+        	    tft.drawLine(0, 140, 240, 140, ILI9341_WHITE); // Linha de separação
+        	    tft.setCursor(10, 200);
+        	    tft.println(initMsg.message);
+
+            if (initMsg.isComplete) {
+                vTaskDelete(NULL);  // Autodestruir a tarefa após sucesso
+            }
+        }
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+}
+
+// Tarefa para ler a temperatura e a humidade
+void TaskReadSensor(void *pvParameters) {
+	DHT11 dht(DHTPIN);
+	SystemData systemData;
+    while (true) {
+    	//if (xQueuePeek(systemDataQueue, &systemData, portMAX_DELAY) == pdPASS) {
+
+        systemData.humidity = dht.readHumidity();
+        systemData.temperature = dht.readTemperature();
+
+        if (systemData.humidity == DHT11::ERROR_TIMEOUT
+                || systemData.humidity == DHT11::ERROR_CHECKSUM
+                || systemData.temperature == DHT11::ERROR_TIMEOUT
+                || systemData.temperature == DHT11::ERROR_CHECKSUM) {
+            Serial.println("Falha ao ler do sensor DHT11!");
+        }
+
+        if (xQueueOverwrite(systemDataQueue, &systemData) != pdPASS) {
+            Serial.println("Falha ao enviar dados para a fila systemDataQueue!");
+        }
+    	//}
+
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+}
+
+// Tarefa para processar os dados e decidir as ações
+void TaskBrain(void *pvParameters) {
+    SystemData systemData;
+    InitMessage initMsg;
+
+    strcpy(initMsg.message, "Aguarda Cartao");
+    initMsg.isComplete = false;
+    xQueueSend(initQueue, &initMsg, portMAX_DELAY);
+
+    bool rfidSuccess = false;
+    if (xQueuePeek(rfidQueue, &rfidSuccess, portMAX_DELAY) == pdPASS && rfidSuccess) {
+        strcpy(initMsg.message, "Cartao valido!");
+        initMsg.isComplete = true;
+        xQueueSend(initQueue, &initMsg, portMAX_DELAY);
+    } else {
+        strcpy(initMsg.message, "Acesso Negado");
+        initMsg.isComplete = false;
+        xQueueSend(initQueue, &initMsg, portMAX_DELAY);
+    }
+
+    while (true) {
+        if (xQueuePeek(systemDataQueue, &systemData, portMAX_DELAY) == pdPASS) {
+            // Atualiza o estado da ventoinha baseado na temperatura
+            systemData.ventState = (systemData.temperature > TEMPERATURE_THRESHOLD);
+
+            // Envia os dados para a fila única (systemDataQueue)
+            if (xQueueOverwrite(systemDataQueue, &systemData) != pdPASS) {
+                Serial.println("Falha ao enviar dados para a fila systemDataQueue!");
+            }
+        }
+
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+}
+void TaskRPM(void *pvParameters)
+{
+    int numero_pulsos_ventoinha; // pulsos contados no intervalo
+    float rpm;
+    float pulsos_por_revolucao = 40;
+
+    SystemData systemData;
+
+    for (;;)
+    {
+    	if (xQueuePeek(systemDataQueue, &systemData, portMAX_DELAY) == pdPASS) {
+
+			numero_pulsos_ventoinha = uxSemaphoreGetCount(contadorRPM);
+			xQueueReset((QueueHandle_t)contadorRPM);
+
+			rpm = ((float)numero_pulsos_ventoinha / (float)pulsos_por_revolucao) * 600.0f;
+
+			Serial.print("Pulsos: ");
+			Serial.print(numero_pulsos_ventoinha);
+
+			int rpm_int = (int)rpm;
+			systemData.rpm = rpm_int;
+
+			Serial.print("  RPM: ");
+			Serial.println(rpm_int);
+
+			if (xQueueOverwrite(systemDataQueue, &systemData) != pdPASS) {
+				Serial.println("Falha ao enviar dados para a fila systemDataQueue!");
+			}
+    	}
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+}
+
+// Tarefa para atualizar o display TFT
+void TaskUpdateDisplay(void *pvParameters) {
+    char buffer[40];
+    SystemData systemData;
+    bool estado_login = false;
+
+    Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCK, TFT_RST);
+    tft.begin();
+    tft.setRotation(2);
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(10, 10);
+    tft.println("Dados Reboque");
+    tft.drawLine(0, 30, 240, 30, ILI9341_WHITE); // Linha de separação
+
+    while (true) {
+        // Verifica se o cartão RFID foi validado
+        xQueuePeek(rfidQueue, &estado_login, portMAX_DELAY);
+
+        if (estado_login) {
+            // Obtém os dados do sensor e estado da ventoinha
+            if (xQueuePeek(systemDataQueue, &systemData, portMAX_DELAY) == pdPASS) {
+                // Imprime a temperatura no display
+                tft.setCursor(10, 50);
+                sprintf(buffer, "Temperatura: %3d C", systemData.temperature);
+                tft.println(buffer);
+
+                // Desenha uma barra de temperatura
+                int tempBarLength = map(systemData.temperature, 0, 70, 0, 220);
+                tft.fillRect(10, 70, tempBarLength, 10, ILI9341_RED);
+                tft.fillRect(10 + tempBarLength, 70, 220 - tempBarLength, 10, ILI9341_BLUE);
+
+                // Imprime a humidade no display
+                tft.setCursor(10, 95);
+                sprintf(buffer, "Humidade: %3d %%", systemData.humidity);
+                tft.println(buffer);
+
+                // Desenha uma barra de humidade
+                int humBarLength = map(systemData.humidity, 0, 220, 0, 220);
+                tft.fillRect(10, 115, humBarLength, 10, ILI9341_GREEN);
+
+                // Exibe o estado da ventoinha
+                tft.setCursor(10, 135);
+                if (systemData.ventState) {
+                    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+                    tft.println("Ventoinha: ON ");
+                } else {
+                    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+                    tft.println("Ventoinha: OFF");
+                }
+
+                // Imprime a rpm no display
+                tft.setCursor(10, 170);
+                sprintf(buffer, "RPM: %6d ", systemData.rpm);
+                tft.println(buffer);
+
+                // Imprime os dados no monitor serie
+                Serial.print("Temperatura: ");
+                Serial.print(systemData.temperature);
+                Serial.print(" C, Humidade: ");
+                Serial.print(systemData.humidity);
+                Serial.print(" %, Ventoinha: ");
+                Serial.println(systemData.ventState ? "ON" : "OFF");
+            }
+        }
+        vTaskDelay(1000 / portTICK_PERIOD_MS);  // Atualiza a cada segundo
+    }
+}
+
+// Tarefa para ler o RFID
+void TaskRFID(void *pvParameters) {
+    SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI);
+    MFRC522 mfrc522(SS_PIN, RST_PIN);
+    mfrc522.PCD_Init();
+    delay(4);
+    mfrc522.PCD_DumpVersionToSerial();
+    mfrc522.PCD_WriteRegister(MFRC522::ComIEnReg, 0x20);
+
+    const byte validUIDs[][4] = { { 0x01, 0x92, 0xAC, 0x29 } };
+    const byte numValidUIDs = sizeof(validUIDs) / sizeof(validUIDs[0]);
+    const byte UIDSize = 4;
+
+    while (true) {
+        xSemaphoreTake(xMutex, portMAX_DELAY);
+        bool cardPresent = mfrc522.PICC_IsNewCardPresent();
+        xSemaphoreGive(xMutex);
+
+        if (cardPresent) {
+            xSemaphoreTake(xMutex, portMAX_DELAY);
+            bool cardRead = mfrc522.PICC_ReadCardSerial();
+            xSemaphoreGive(xMutex);
+
+            if (cardRead) {
+                bool success = false;
+                for (int i = 0; i < numValidUIDs; i++) {
+                    if (mfrc522.uid.size == UIDSize && memcmp(mfrc522.uid.uidByte, validUIDs[i], UIDSize) == 0) {
+                        Serial.println("Cartao Valido!");
+                        success = true;
+                        xQueueOverwrite(rfidQueue, &success);
+                        xTaskCreatePinnedToCore(TaskReadSensor, "TaskReadSensor", 2048, NULL, 3, NULL, 1);
+                        xTaskCreatePinnedToCore(TaskUpdateDisplay, "TaskUpdateDisplay", 4096, NULL, 4, NULL, 1);
+                        xTaskCreatePinnedToCore(TaskRPM, "TaskRPM", 2048, NULL, 2, NULL, 1);
+                        vTaskDelete(NULL);
+                    } else {
+                        success = false;
+                        xQueueOverwrite(rfidQueue, &success);
+                    }
+                }
+                Serial.println("Acesso Negado");
+            }
+        }
+
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+void TaskBuzzer(void *pvParameters) {
+    pinMode(BUZZER_PIN, OUTPUT);
+    while (true) {
+        if (xSemaphoreTake(buzzerSemaphore, portMAX_DELAY) == pdPASS) {
+            digitalWrite(BUZZER_PIN, HIGH);
+            vTaskDelay(250 / portTICK_PERIOD_MS);
+            digitalWrite(BUZZER_PIN, LOW);
+        }
+    }
+}
+
+void TaskVentoinha(void *pvParameters) {
+    SystemData systemData;
+
+    while (true) {
+        // Verifica o estado da ventoinha e controla sua velocidade
+        if (xQueuePeek(systemDataQueue, &systemData, portMAX_DELAY) == pdPASS) {
+            int potValue = analogRead(POT_PIN);
+            int fanSpeed = map(potValue, 0, 1023, 0, 255);
+
+            if (systemData.ventState) {
+                analogWrite(FAN_PIN, fanSpeed);
+            } else {
+                analogWrite(FAN_PIN, 0);
+            }
+        }
+
+        vTaskDelay(1000 / portTICK_PERIOD_MS);  // Atualiza a cada segundo
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1); //Coloca a prioridade do setup como máxima
+
+    pinMode(FAN_PIN, OUTPUT);
+    pinMode(IRQ_PIN, INPUT_PULLUP);
+    pinMode(RPM_PIN, INPUT_PULLUP);
+    attachInterrupt(IRQ_PIN, handleRFIDInterrupt, RISING);
+    attachInterrupt(RPM_PIN, handleRPMInterrupt, RISING);
+
+    // Inicializa as queues
+    systemDataQueue = xQueueCreate(1, sizeof(SystemData));
+    rfidQueue = xQueueCreate(1, sizeof(bool));
+    initQueue = xQueueCreate(1, sizeof(InitMessage));
+
+    // Criação os semáforos
+    xMutex = xSemaphoreCreateMutex();
+    buzzerSemaphore = xSemaphoreCreateBinary();
+    contadorRPM = xSemaphoreCreateCounting(0xFFFF, 0);
+
+    // Cria as tasks
+    xTaskCreatePinnedToCore(TaskBrain, "TaskBrain", 2048, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(TaskRFID, "TaskRFID", 2048, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(TaskVentoinha, "TaskVentoinha", 2048, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(TaskInitialize, "TaskInitialize", 2048, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(TaskBuzzer, "TaskBuzzer", 2048, NULL, 1, NULL, 1);
+
+}
+
+void loop() {
+	vTaskDelete(NULL);
+}
