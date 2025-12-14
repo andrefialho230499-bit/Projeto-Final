@@ -228,7 +228,7 @@ void TaskRPM(void *pvParameters)
 				Serial.println("Falha ao enviar dados para a fila systemDataQueue!");
 			}
     	}
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
 
